@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# dnstm-setup v1.4.0
+# dnstm-setup v1.4.1
 # Interactive DNS Tunnel Setup
 # Sets up Slipstream + DNSTT + NoizDNS + VayDNS tunnels for censorship-resistant internet access
 #
@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 TOTAL_STEPS=12
 
 # ─── Safety: ensure DNS is never left broken on exit ──────────────────────────
@@ -153,6 +153,31 @@ dnstm_has_tunnels() {
     local output
     output=$(dnstm tunnel list 2>/dev/null || true)
     [[ -n "$output" ]] && echo "$output" | grep -qiE 'tag=|slip|dnstt|noiz|vay|xray'
+}
+
+# Check if installed dnstm has native VayDNS transport support (v0.7.0+).
+# Returns 0 (true) if native vaydns is supported, 1 (false) if we need the
+# legacy DNSTT-with-binary-swap approach.
+# Result is cached in _DNSTM_VAYDNS_NATIVE for the duration of the script run.
+_DNSTM_VAYDNS_NATIVE=""
+dnstm_supports_vaydns() {
+    if [[ "$_DNSTM_VAYDNS_NATIVE" == "yes" ]]; then
+        return 0
+    fi
+    if [[ "$_DNSTM_VAYDNS_NATIVE" == "no" ]]; then
+        return 1
+    fi
+    if ! command -v dnstm &>/dev/null; then
+        _DNSTM_VAYDNS_NATIVE="no"
+        return 1
+    fi
+    if timeout 5 dnstm tunnel add --help 2>&1 | grep -qE -- '--transport.*vaydns|VayDNS'; then
+        _DNSTM_VAYDNS_NATIVE="yes"
+        return 0
+    else
+        _DNSTM_VAYDNS_NATIVE="no"
+        return 1
+    fi
 }
 
 prompt_yn() {
@@ -1459,16 +1484,22 @@ do_diag() {
         for tag in $tags; do
             [[ "$tag" != vay* ]] && continue
             local dropin="/etc/systemd/system/dnstm-${tag}.service.d/10-vaydns-binary.conf"
+            local svc_unit_exec
+            svc_unit_exec=$(timeout 5 systemctl cat "dnstm-${tag}.service" 2>/dev/null | grep -E '^ExecStart=' | head -1 || true)
             if [[ -f "$dropin" ]]; then
+                # Legacy: binary swap drop-in
                 if grep -q "vaydns-server" "$dropin" 2>/dev/null; then
-                    print_ok "${tag}: binary override present (vaydns-server)"
+                    print_ok "${tag}: legacy binary override present (vaydns-server)"
                 else
                     print_fail "${tag}: override exists but doesn't reference vaydns-server"
                     issues=$((issues + 1))
                 fi
+            elif echo "$svc_unit_exec" | grep -q "vaydns-server"; then
+                # Native: dnstm v0.7.0+ uses vaydns-server directly
+                print_ok "${tag}: native VayDNS service (dnstm-managed)"
             else
-                print_fail "${tag}: no binary override — running dnstt-server instead of vaydns-server"
-                echo -e "    ${DIM}Fix: re-run setup or: create_vaydns_service_override ${tag}${NC}"
+                print_fail "${tag}: not running vaydns-server"
+                echo -e "    ${DIM}Fix: upgrade dnstm or run: sudo bash $0 --add-tunnel${NC}"
                 issues=$((issues + 1))
             fi
         done
@@ -2566,11 +2597,17 @@ do_add_tunnel() {
             fi
             ;;
         4)
-            transport="dnstt"
             use_vaydns=true
-            if ! ensure_vaydns_binary; then
-                print_fail "VayDNS binary not available. Cannot create VayDNS tunnel."
-                exit 1
+            if dnstm_supports_vaydns; then
+                # Native VayDNS support — dnstm handles the binary itself
+                transport="vaydns"
+            else
+                # Legacy: create as dnstt and swap binary via systemd drop-in
+                transport="dnstt"
+                if ! ensure_vaydns_binary; then
+                    print_fail "VayDNS binary not available. Cannot create VayDNS tunnel."
+                    exit 1
+                fi
             fi
             ;;
         *)
@@ -2661,8 +2698,11 @@ do_add_tunnel() {
     # Create the tunnel
     print_info "Creating tunnel: ${tag}..."
     local create_output
+    local extra_flags=""
+    # Native VayDNS: add --dnstt-compat so SlipNet's built-in DNSTT client works
+    [[ "$transport" == "vaydns" ]] && extra_flags="--dnstt-compat"
     # shellcheck disable=SC2086
-    create_output=$(dnstm tunnel add --transport "$transport" --backend "$backend" --domain "$domain" --tag "$tag" $mtu_flag 2>&1) || true
+    create_output=$(dnstm tunnel add --transport "$transport" --backend "$backend" --domain "$domain" --tag "$tag" $mtu_flag $extra_flags 2>&1) || true
     echo "$create_output"
 
     if dnstm_tag_exists "$tag"; then
@@ -2679,7 +2719,9 @@ do_add_tunnel() {
         systemctl daemon-reload 2>/dev/null || true
     fi
 
-    if [[ "$use_vaydns" == true ]]; then
+    # Legacy VayDNS path: swap binary via systemd drop-in.
+    # Native path (transport=vaydns): dnstm already configured the service correctly.
+    if [[ "$use_vaydns" == true && "$transport" != "vaydns" ]]; then
         create_vaydns_service_override "$tag" || print_warn "Could not set VayDNS binary for ${tag}"
         systemctl stop "dnstm-${tag}.service" 2>/dev/null || true
         systemctl daemon-reload 2>/dev/null || true
@@ -2742,14 +2784,15 @@ do_add_tunnel() {
         local s_user="$SOCKS_USER" s_pass="$SOCKS_PASS"
 
         local pubkey_for_url=""
-        if [[ "$transport" == "dnstt" && -f "/etc/dnstm/tunnels/${tag}/server.pub" ]]; then
+        if [[ "$transport" != "slipstream" && -f "/etc/dnstm/tunnels/${tag}/server.pub" ]]; then
             pubkey_for_url=$(cat "/etc/dnstm/tunnels/${tag}/server.pub" 2>/dev/null || true)
         fi
 
         local slipnet_type
         case "$transport" in
             slipstream) slipnet_type="ss" ;;
-            dnstt) slipnet_type="dnstt" ;;
+            dnstt)      slipnet_type="dnstt" ;;
+            vaydns)     slipnet_type="dnstt" ;;  # VayDNS in dnstt-compat mode
         esac
         # NoizDNS tunnels use dnstt transport but need sayedns type for SlipNet
         [[ "$use_noizdns" == true || "$tag" == noiz* ]] && slipnet_type="sayedns"
@@ -5807,8 +5850,12 @@ step_install_dnstm() {
     echo ""
     ensure_noizdns_binary || true
 
-    echo ""
-    ensure_vaydns_binary || true
+    # Skip downloading vaydns-server if dnstm v0.7.0+ has native support
+    # (dnstm downloads/manages its own binary in that case)
+    if ! dnstm_supports_vaydns; then
+        echo ""
+        ensure_vaydns_binary || true
+    fi
 }
 
 # ─── STEP 6: Verify Port 53 ────────────────────────────────────────────────────
@@ -5883,7 +5930,9 @@ step_create_tunnels() {
     local any_created=false
     local _tunnel_count=4
     [[ -x /usr/local/bin/noizdns-server ]] && _tunnel_count=6
-    [[ -x /usr/local/bin/vaydns-server ]] && _tunnel_count=$((_tunnel_count + 2))
+    if [[ -x /usr/local/bin/vaydns-server ]] || dnstm_supports_vaydns; then
+        _tunnel_count=$((_tunnel_count + 2))
+    fi
     print_info "Creating ${_tunnel_count} tunnels for domain: ${BOLD}${DOMAIN}${NC}"
     echo ""
 
@@ -6030,18 +6079,34 @@ step_create_tunnels() {
     fi
 
     # ─── VayDNS tunnels (7 & 8) ───
-    if [[ -x /usr/local/bin/vaydns-server ]]; then
+    # dnstm v0.7.0+ has native VayDNS support — use --transport vaydns directly.
+    # Older dnstm versions need the legacy DNSTT-with-binary-swap approach.
+    local _vay_native=false
+    if dnstm_supports_vaydns; then
+        _vay_native=true
+    fi
+
+    if [[ "$_vay_native" == true ]] || [[ -x /usr/local/bin/vaydns-server ]]; then
         echo ""
         echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
         echo -e "  ${BOLD}Tunnel 7: VayDNS + SOCKS (optimized)${NC}"
         echo ""
-        if dnstm tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag vay1 --mtu "$DNSTT_MTU" 2>&1; then
-            print_ok "Created: vay1 (VayDNS + SOCKS) on v.${DOMAIN}"
-            any_created=true
+        if [[ "$_vay_native" == true ]]; then
+            if dnstm tunnel add --transport vaydns --backend socks --domain "v.${DOMAIN}" --tag vay1 --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: vay1 (VayDNS + SOCKS) on v.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay1 may already exist or creation failed"
+            fi
         else
-            print_warn "Tunnel vay1 may already exist or creation failed"
+            if dnstm tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag vay1 --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: vay1 (VayDNS + SOCKS) on v.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay1 may already exist or creation failed"
+            fi
+            create_vaydns_service_override "vay1" || print_warn "Could not set VayDNS binary for vay1"
         fi
-        create_vaydns_service_override "vay1" || print_warn "Could not set VayDNS binary for vay1"
 
         if [[ -f /etc/dnstm/tunnels/vay1/server.pub ]]; then
             VAYDNS_PUBKEY=$(cat /etc/dnstm/tunnels/vay1/server.pub 2>/dev/null || true)
@@ -6055,20 +6120,31 @@ step_create_tunnels() {
         echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
         echo -e "  ${BOLD}Tunnel 8: VayDNS + SSH (optimized)${NC}"
         echo ""
-        if dnstm tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag vay-ssh --mtu "$DNSTT_MTU" 2>&1; then
-            print_ok "Created: vay-ssh (VayDNS + SSH) on vz.${DOMAIN}"
-            any_created=true
+        if [[ "$_vay_native" == true ]]; then
+            if dnstm tunnel add --transport vaydns --backend ssh --domain "vz.${DOMAIN}" --tag vay-ssh --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: vay-ssh (VayDNS + SSH) on vz.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay-ssh may already exist or creation failed"
+            fi
         else
-            print_warn "Tunnel vay-ssh may already exist or creation failed"
+            if dnstm tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag vay-ssh --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: vay-ssh (VayDNS + SSH) on vz.${DOMAIN}"
+                any_created=true
+            else
+                print_warn "Tunnel vay-ssh may already exist or creation failed"
+            fi
+            create_vaydns_service_override "vay-ssh" || print_warn "Could not set VayDNS binary for vay-ssh"
         fi
-        create_vaydns_service_override "vay-ssh" || print_warn "Could not set VayDNS binary for vay-ssh"
         echo ""
 
-        # Stop VayDNS tunnels so step_start_services can start them fresh
-        systemctl stop "dnstm-vay1.service" 2>/dev/null || true
-        systemctl stop "dnstm-vay-ssh.service" 2>/dev/null || true
-
-        fix_vaydns_transport
+        # Legacy path needs binary swap to take effect on next start.
+        # Native path: dnstm already has the right ExecStart, no need to stop.
+        if [[ "$_vay_native" != true ]]; then
+            systemctl stop "dnstm-vay1.service" 2>/dev/null || true
+            systemctl stop "dnstm-vay-ssh.service" 2>/dev/null || true
+            fix_vaydns_transport
+        fi
     else
         echo ""
         print_warn "VayDNS binary not available — skipping VayDNS tunnels (v, vz subdomains)"
@@ -6128,7 +6204,9 @@ step_start_services() {
     if [[ -z "$all_tags" ]]; then
         all_tags="slip1 dnstt1 slip-ssh dnstt-ssh"
         [[ -x /usr/local/bin/noizdns-server ]] && all_tags+=" noiz1 noiz-ssh"
-        [[ -x /usr/local/bin/vaydns-server ]] && all_tags+=" vay1 vay-ssh"
+        if [[ -x /usr/local/bin/vaydns-server ]] || dnstm_supports_vaydns; then
+            all_tags+=" vay1 vay-ssh"
+        fi
     fi
     for tag in $all_tags; do
         print_info "Starting tunnel: ${tag}..."
@@ -6624,7 +6702,9 @@ step_tests() {
         running_count=$(echo "$tunnel_output" | grep -ci "running" || echo "0")
         local expected_tunnels=4
         [[ -x /usr/local/bin/noizdns-server ]] && expected_tunnels=6
-        [[ -x /usr/local/bin/vaydns-server ]] && expected_tunnels=$((expected_tunnels + 2))
+        if [[ -x /usr/local/bin/vaydns-server ]] || dnstm_supports_vaydns; then
+            expected_tunnels=$((expected_tunnels + 2))
+        fi
         if [[ "$running_count" -ge "$expected_tunnels" ]]; then
             print_ok "All tunnels running: PASS (${running_count} running)"
             pass=$((pass + 1))
@@ -7284,9 +7364,15 @@ do_add_domain() {
         fix_noizdns_transport
     fi
 
-    # VayDNS tunnels — download binary if not available, then create tunnels
-    ensure_vaydns_binary || true
-    if [[ -x /usr/local/bin/vaydns-server ]]; then
+    # VayDNS tunnels — native (dnstm v0.7.0+) or legacy (binary swap)
+    local _vay_native=false
+    if dnstm_supports_vaydns; then
+        _vay_native=true
+    else
+        ensure_vaydns_binary || true
+    fi
+
+    if [[ "$_vay_native" == true ]] || [[ -x /usr/local/bin/vaydns-server ]]; then
         local vay_tag="vay${num}"
         local vay_ssh_tag="vay-ssh${num}"
 
@@ -7294,12 +7380,20 @@ do_add_domain() {
         echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
         echo -e "  ${BOLD}Tunnel: VayDNS + SOCKS (optimized)${NC}"
         echo ""
-        if dnstm tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag "$vay_tag" --mtu "$DNSTT_MTU" 2>&1; then
-            print_ok "Created: ${vay_tag} (VayDNS + SOCKS) on v.${DOMAIN}"
+        if [[ "$_vay_native" == true ]]; then
+            if dnstm tunnel add --transport vaydns --backend socks --domain "v.${DOMAIN}" --tag "$vay_tag" --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: ${vay_tag} (VayDNS + SOCKS) on v.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_tag} may already exist or creation failed"
+            fi
         else
-            print_warn "Tunnel ${vay_tag} may already exist or creation failed"
+            if dnstm tunnel add --transport dnstt --backend socks --domain "v.${DOMAIN}" --tag "$vay_tag" --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: ${vay_tag} (VayDNS + SOCKS) on v.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_tag} may already exist or creation failed"
+            fi
+            create_vaydns_service_override "$vay_tag" || print_warn "Could not set VayDNS binary for ${vay_tag}"
         fi
-        create_vaydns_service_override "$vay_tag" || print_warn "Could not set VayDNS binary for ${vay_tag}"
 
         if [[ -f "/etc/dnstm/tunnels/${vay_tag}/server.pub" ]]; then
             VAYDNS_PUBKEY=$(cat "/etc/dnstm/tunnels/${vay_tag}/server.pub" 2>/dev/null || true)
@@ -7309,18 +7403,28 @@ do_add_domain() {
         echo -e "  ${DIM}───────────────────────────────────────────────${NC}"
         echo -e "  ${BOLD}Tunnel: VayDNS + SSH (optimized)${NC}"
         echo ""
-        if dnstm tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag "$vay_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
-            print_ok "Created: ${vay_ssh_tag} (VayDNS + SSH) on vz.${DOMAIN}"
+        if [[ "$_vay_native" == true ]]; then
+            if dnstm tunnel add --transport vaydns --backend ssh --domain "vz.${DOMAIN}" --tag "$vay_ssh_tag" --mtu "$DNSTT_MTU" --dnstt-compat 2>&1; then
+                print_ok "Created: ${vay_ssh_tag} (VayDNS + SSH) on vz.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_ssh_tag} may already exist or creation failed"
+            fi
         else
-            print_warn "Tunnel ${vay_ssh_tag} may already exist or creation failed"
+            if dnstm tunnel add --transport dnstt --backend ssh --domain "vz.${DOMAIN}" --tag "$vay_ssh_tag" --mtu "$DNSTT_MTU" 2>&1; then
+                print_ok "Created: ${vay_ssh_tag} (VayDNS + SSH) on vz.${DOMAIN}"
+            else
+                print_warn "Tunnel ${vay_ssh_tag} may already exist or creation failed"
+            fi
+            create_vaydns_service_override "$vay_ssh_tag" || print_warn "Could not set VayDNS binary for ${vay_ssh_tag}"
         fi
-        create_vaydns_service_override "$vay_ssh_tag" || print_warn "Could not set VayDNS binary for ${vay_ssh_tag}"
         echo ""
 
-        systemctl stop "dnstm-${vay_tag}.service" 2>/dev/null || true
-        systemctl stop "dnstm-${vay_ssh_tag}.service" 2>/dev/null || true
-
-        fix_vaydns_transport
+        # Legacy: stop services so they restart with the new binary
+        if [[ "$_vay_native" != true ]]; then
+            systemctl stop "dnstm-${vay_tag}.service" 2>/dev/null || true
+            systemctl stop "dnstm-${vay_ssh_tag}.service" 2>/dev/null || true
+            fix_vaydns_transport
+        fi
     fi
 
     print_ok "All tunnels created"
@@ -7339,8 +7443,8 @@ do_add_domain() {
     if [[ -x /usr/local/bin/noizdns-server ]]; then
         _start_tags+=" ${noiz_tag:-} ${noiz_ssh_tag:-}"
     fi
-    if [[ -x /usr/local/bin/vaydns-server ]]; then
-        _start_tags+=" ${vay_tag:-} ${vay_ssh_tag:-}"
+    if [[ -n "${vay_tag:-}" ]]; then
+        _start_tags+=" ${vay_tag} ${vay_ssh_tag:-}"
     fi
     print_info "Starting new tunnels..."
     for tag in $_start_tags; do
